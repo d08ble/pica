@@ -34,97 +34,24 @@ try {
   __cvs = null;
 }
 
-var resize       = require('./lib/resize');
-var resizeWorker = require('./lib/resize_worker');
-var resizeWebgl  = require('./lib/resize_webgl');
-
+var resize_js     = require('./lib/resize_js');
+var resize_js_ww  = require('./lib/resize_js_ww');
+var resize_webgl  = require('./lib/resize_webgl');
+var resize_array  = require('./lib/js/resize_array');
+var unsharp       = require('./lib/js/unsharp');
+var assign        = require('object-assign');
 
 ////////////////////////////////////////////////////////////////////////////////
 // Helpers
 function _class(obj) { return Object.prototype.toString.call(obj); }
 function isFunction(obj) { return _class(obj) === '[object Function]'; }
 
-
 ////////////////////////////////////////////////////////////////////////////////
 // API methods
-
-
-// RGBA buffer async resize
-//
-function resizeBuffer(options, callback) {
-  var wr;
-
-  var _opts = {
-    src:      options.src,
-    dest:     null,
-    width:    options.width|0,
-    height:   options.height|0,
-    toWidth:  options.toWidth|0,
-    toHeight: options.toHeight|0,
-    quality:  options.quality,
-    alpha:    options.alpha,
-    unsharpAmount:    options.unsharpAmount,
-    unsharpRadius:    options.unsharpRadius,
-    unsharpThreshold: options.unsharpThreshold
-  };
-
-  // Force flag reset to simplify status check
-  if (!WORKER) { exports.WW = false; }
-
-  if (WORKER && exports.WW) {
-    exports.debug('Resize buffer in WebWorker');
-
-    wr = require('webworkify')(resizeWorker);
-
-    wr.onmessage = function(ev) {
-      var i, l,
-          dest = options.dest,
-          output = ev.data.output;
-
-      // If we got output buffer by reference, we should copy data,
-      // because WW returns independent instance
-      if (dest) {
-        // IE ImageData can return old-style CanvasPixelArray
-        // without .set() method. Copy manually for such case.
-        if (dest.set) {
-          dest.set(output);
-        } else {
-          for (i = 0, l = output.length; i < l; i++) {
-            dest[i] = output[i];
-          }
-        }
-      }
-      callback(ev.data.err, output);
-      wr.terminate();
-    };
-
-    if (options.transferable) {
-      wr.postMessage(_opts, [ options.src.buffer ]);
-    } else {
-      wr.postMessage(_opts);
-    }
-    // Expose worker when available, to allow early termination.
-    return wr;
-  }
-
-  // Fallback to sync call, if WebWorkers not available
-  exports.debug('Resize buffer sync (freeze event loop)');
-
-  _opts.dest = options.dest;
-  resize(_opts, callback);
-  return null;
-}
-
 
 // Canvas async resize
 //
 function resizeCanvas(from, to, options, callback) {
-  var w = from.width,
-      h = from.height,
-      w2 = to.width,
-      h2 = to.height;
-  var ctxTo, imageDataTo;
-
   if (isFunction(options)) {
     callback = options;
     options = {};
@@ -140,53 +67,71 @@ function resizeCanvas(from, to, options, callback) {
   if (WEBGL && exports.WEBGL) {
     exports.debug('Resize canvas with WebGL');
 
-    return resizeWebgl(from, to, options, function (err) {
+    var id = resize_webgl(from, to, options, function (err) {
       if (err) {
         exports.debug('WebGL resize failed, do fallback and cancel next attempts');
         exports.debug(err);
 
         WEBGL = false;
-        return resizeCanvas(from, to, options, callback);
+        resizeCanvas(from, to, assign({}, options, { _id: id }), callback);
+      } else {
+        callback();
       }
-      callback();
     });
-
+    return id;
   }
 
-  exports.debug('Resize canvas: prepare data');
+  // Force flag reset to simplify status check
+  if (!WORKER) { exports.WW = false; }
 
-  ctxTo = to.getContext('2d');
-  imageDataTo = ctxTo.createImageData(w2, h2);
+  if (WORKER && exports.WW) {
+    exports.debug('Resize buffer in WebWorker');
 
+    return resize_js_ww(from, to, options, callback);
+  }
+
+  // Fallback to sync call, if WebWorkers not available
+  exports.debug('Resize buffer sync (freeze event loop)');
+
+  return resize_js(from, to, options, callback);
+}
+
+// RGBA buffer resize
+//
+function resizeBuffer(options, callback) {
   var _opts = {
-    src:      from.getContext('2d').getImageData(0, 0, w, h).data,
-    dest:     imageDataTo.data,
-    width:    from.width,
-    height:   from.height,
-    toWidth:  to.width,
-    toHeight: to.height,
+    src:      options.src,
+    dest:     options.dest,
+    width:    options.width|0,
+    height:   options.height|0,
+    toWidth:  options.toWidth|0,
+    toHeight: options.toHeight|0,
     quality:  options.quality,
     alpha:    options.alpha,
     unsharpAmount:    options.unsharpAmount,
     unsharpRadius:    options.unsharpRadius,
-    unsharpThreshold: options.unsharpThreshold,
-    transferable: true
+    unsharpThreshold: options.unsharpThreshold
   };
 
-  return resizeBuffer(_opts, function (err/*, output*/) {
-    if (err) {
-      callback(err);
-      return;
-    }
+  _opts.dest = resize_array(_opts);
 
-    ctxTo.putImageData(imageDataTo, 0, 0);
-    callback();
-  });
+  if (_opts.unsharpAmount) {
+    unsharp(_opts.dest, _opts.toWidth, _opts.toHeight,
+      _opts.unsharpAmount, _opts.unsharpRadius, _opts.unsharpThreshold);
+  }
+
+  callback(null, _opts.dest);
 }
 
+function terminate(id) {
+  resize_js.terminate(id);
+  resize_js_ww.terminate(id);
+  resize_webgl.terminate(id);
+}
 
-exports.resizeBuffer = resizeBuffer;
 exports.resizeCanvas = resizeCanvas;
+exports.resizeBuffer = resizeBuffer;
+exports.terminate = terminate;
 exports.WW = WORKER;
 exports.WEBGL = false; // WEBGL;
 exports.debug = function () {};
